@@ -87,7 +87,7 @@ class FairBatch(Sampler):
         
         # Takes the unique values of the tensors
         self.z_item = list(set(z_tensor.tolist()))
-        self.y_item = list(set(y_tensor.tolist()))
+        self.y_item = list(set(y_tensor.squeeze().tolist()))
         
         self.yz_tuple = list(itertools.product(self.y_item, self.z_item))
         
