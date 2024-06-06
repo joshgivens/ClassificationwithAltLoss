@@ -143,7 +143,6 @@ def AUC(fpr, tpr):
 
 import torch as t
 import pylab as pl
-from IPython import display
 
 # Let us maximize the AUC
 import torch # bring out the big gun
@@ -153,30 +152,49 @@ torch.manual_seed(0)
 class MLP(torch.nn.Module):
     def __init__(self, d):
         super().__init__()
-        self.fc1 = torch.nn.Linear(d, d*2)
-        self.fc2 = torch.nn.Linear(d*2, d*2)
-        self.out = torch.nn.Linear(d*2, 2)
-
-        self.dropout = torch.nn.Dropout(0.5)
+        self.fc1 = torch.nn.Linear(d, d*3)
+        self.fc2 = torch.nn.Linear(d*3, d)
+        self.dropout = torch.nn.Dropout(0.1)
         self.relu = torch.nn.ReLU()
-        # self.lin = torch.nn.Linear(d, 2)
-
     def forward(self, x):
         x = self.relu(self.fc1(x))
+        x = self.fc2(x)
         x = self.dropout(x)
-        x = self.relu(self.fc2(x))
-        x = self.dropout(x)
+        return x
+
+class Block(torch.nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.mlp1 = MLP(d)
+        self.mlp2 = MLP(d)
+        self.bn = torch.nn.BatchNorm1d(d)
+        self.ln1 = torch.nn.LayerNorm(d)
+        self.ln2 = torch.nn.LayerNorm(d)
+        self.relu = torch.nn.ReLU()
+        self.out = torch.nn.Linear(d, 2)
+    def forward(self, x):
+        x = x + self.mlp1(self.ln1(x))
+        # x = x + self.mlp2(self.ln2(x))
         return self.out(x)
-        # return self.lin(x)
+
+# class Block(torch.nn.Module):
+#     def __init__(self, d):
+#         super().__init__()
+#         self.out = torch.nn.Linear(d, 2)
+#     def forward(self, x):
+#         return self.out(x)
 
 class Model3(torch.nn.Module):
     def __init__(self, d):
         super(Model3, self).__init__()
-        self.h = MLP(d)
+        self.h = Block(d)
 
     def forward(self, X, returns='logits'):
         logits = self.h(X).squeeze()
-
+        if returns == 'both':
+            ps = torch.nn.functional.softmax(logits, dim=1)
+            diff = ps[:,1] - ps[:,0] # positive
+            return logits, diff
         if returns == 'logits': return logits
         elif returns == 'posprob':
             ps = torch.nn.functional.softmax(logits, dim=1)
@@ -187,9 +205,32 @@ class Model3(torch.nn.Module):
         else:
             raise ValueError('returns is not valid')
 
+class Ensemble(torch.nn.Module):
+    def __init__(self, d, n):
+        super(Ensemble, self).__init__()
+        self.models = torch.nn.ModuleList([Model3(d) for _ in range(n)])
+        self.n = n
+    def forward(self, X, returns='logits'):
+        if returns == 'both':
+            results = [m(X, returns=returns) for m in self.models]
+            results = [[x,y] for (x,y) in results]
+        else:
+            results = [[m(X, returns=returns)] for m in self.models]
+
+        res = results[0]
+        for i in range(1, self.n):
+            for j in range(len(res)): res[j] += results[i][j]
+        for j in range(len(res)): res[j] /= self.n
+
+        if returns == 'both':
+            return (res[0], res[1])
+        else:
+            return res[0]
 
 
-device = 'cpu'
+
+
+device = 'cuda'
 X_tr = torch.tensor(X_train, dtype = torch.float32, device=device)
 y_tr = torch.tensor(y_train, dtype = torch.float32, device=device)
 X_te = torch.tensor(X_test, dtype = torch.float32, device=device)
@@ -206,37 +247,57 @@ pos_loader = torch.utils.data.DataLoader(pos_dataset, batch_size = batch_size)
 neg_loader = torch.utils.data.DataLoader(neg_dataset, batch_size = batch_size)
 
 # ppath = "params/model3_tune.pth"
-model3 = Model3(X_tr.shape[1]).to(device)
+# model3 = Model3(X_tr.shape[1]).to(device)
+
 # model3.load_state_dict(torch.load(ppath))
+model3 = Ensemble(X_tr.shape[1], 3).to(device)
 
 nepoch = 200
-opt = torch.optim.Adam(model3.parameters(), lr=1e-2)
+opt = torch.optim.Adam(model3.parameters(), lr=3e-3, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, nepoch, eta_min=1e-5)
+
+cross_ent = torch.nn.CrossEntropyLoss()
 
 """%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"""
 for epoch in range(nepoch):
     model3.train()
+
     xneg = None; yneg = None
     xpos, ypos = next(iter(pos_loader))
-    nrepeat = 100
+    # nrepeat = 89
+    nrepeat = 2
     for i, (_xneg, _yneg) in enumerate(neg_loader):
-        if i == nrepeat: break
-        if xneg is None:
-            xneg = _xneg; yneg = _yneg
-        else:
-            xneg = torch.cat((xneg, _xneg), 0)
-            yneg = torch.cat((yneg, _yneg), 0)
+      if i == nrepeat: break
+      if xneg is None:
+          xneg = _xneg; yneg = _yneg
+      else:
+          xneg = torch.cat((xneg, _xneg), 0)
+          yneg = torch.cat((yneg, _yneg), 0)
 
     xpos = t.cat([xpos]*nrepeat, 0)
-    ypos = t.cat([ypos]*nrepeat, 0)
+    ypos = t.cat([ypos]*nrepeat, 0).long()
+    yneg = yneg.long()
+
+    assert len(xpos) == len(xneg), f"wrong number of pairwise samples. try decreasing n_repeat...?"
 
     xpos = xpos.to(device); xneg = xneg.to(device)
 
     opt.zero_grad()
-    hpos = model3(xpos, returns='diff')
-    hneg = model3(xneg, returns='diff')
+    hpos, hpos_score = model3(xpos, returns='both')
+    hneg, hneg_score = model3(xneg, returns='both')
 
-    loss = (1 - hpos + hneg).square().mean()
+    pos_ce = cross_ent(hpos, ypos)
+    neg_ce = cross_ent(hneg, yneg)
+    l2 = (1 - hpos_score + hneg_score).square().mean()
+    # loss = l2 + pos_ce + neg_ce
+
+    # hinge = (1- hpos_score + hneg_score).clamp(min=0).mean()
+    # loss = pos_ce + neg_ce + hinge
+
+    # loss = hinge
+    loss = l2
+
+
     (loss).backward()
     opt.step()
     scheduler.step()
@@ -267,59 +328,3 @@ for epoch in range(nepoch):
     acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
     acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
     print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}| acc_tr {acc_tr:.3f}|acc_te {acc_te:.3f}|lr {lr:.5f}")
-"""%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"""
-
-# loss_fn = torch.nn.CrossEntropyLoss()
-
-# for epoch in range(nepoch):
-#     xpos, ypos = next(iter(pos_loader))
-#     xneg, yneg = next(iter(neg_loader))
-
-#     xpos = xpos.to(device); xneg = xneg.to(device)
-#     ypos = ypos.to(device); yneg = yneg.to(device)
-
-#     X = t.cat((xpos, xneg), 0)
-#     y = t.cat((ypos, yneg), 0)
-
-#     rixs = t.randperm(len(X))
-
-#     X = X[rixs]; y = y[rixs]
-
-#     model3.train()
-#     opt.zero_grad()
-#     logits = model3(X)
-
-#     loss = loss_fn(logits, y.long())
-
-#     (loss).backward()
-#     opt.step()
-#     scheduler.step()
-
-
-#     model3.eval()
-#     pred_te = model3(X_te, returns='diff')
-#     pred_te = pred_te.detach().cpu().numpy()
-
-#     pred_tr = model3(X_tr, returns='diff')
-#     pred_tr = pred_tr.detach().cpu().numpy()
-
-
-#     fpr_te, tpr_te = roc(pred_te, y_test)
-#     auc_te = AUC(fpr_te, tpr_te)
-
-#     fpr_tr, tpr_tr = roc(pred_tr, y_train)
-#     auc_tr = AUC(fpr_tr, tpr_tr)
-
-#     loss_print = loss.detach().cpu().item()
-#     lr = opt.param_groups[0]['lr']
-
-
-#     pred_te = model3(X_te, returns='posprob')
-#     pred_te = pred_te.detach().cpu().numpy()
-
-#     pred_tr = model3(X_tr, returns='posprob')
-#     pred_tr = pred_tr.detach().cpu().numpy()
-
-#     acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
-#     acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
-#     print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}|acc_tr {acc_tr:.2f}|acc_te {acc_te:.2f}|lr {lr:.5f}")
