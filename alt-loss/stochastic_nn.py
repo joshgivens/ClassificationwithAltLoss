@@ -156,15 +156,18 @@ class MLP(torch.nn.Module):
         self.fc1 = torch.nn.Linear(d, d*2)
         self.fc2 = torch.nn.Linear(d*2, d*2)
         self.out = torch.nn.Linear(d*2, 2)
+
         self.dropout = torch.nn.Dropout(0.5)
         self.relu = torch.nn.ReLU()
+        # self.lin = torch.nn.Linear(d, 2)
 
     def forward(self, x):
         x = self.relu(self.fc1(x))
-        # x = self.dropout(x)
+        x = self.dropout(x)
         x = self.relu(self.fc2(x))
-        # x = self.dropout(x)
+        x = self.dropout(x)
         return self.out(x)
+        # return self.lin(x)
 
 class Model3(torch.nn.Module):
     def __init__(self, d):
@@ -206,70 +209,38 @@ neg_loader = torch.utils.data.DataLoader(neg_dataset, batch_size = batch_size)
 model3 = Model3(X_tr.shape[1]).to(device)
 # model3.load_state_dict(torch.load(ppath))
 
-nepoch = 1000
+nepoch = 200
 opt = torch.optim.Adam(model3.parameters(), lr=1e-2)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, nepoch, eta_min=1e-5)
 
-# for epoch in range(nepoch):
-#     model3.train()
-#     xpos, ypos = next(iter(pos_loader))
-#     xneg, yneg = next(iter(neg_loader))
-
-#     xpos = xpos.to(device); xneg = xneg.to(device)
-
-#     opt.zero_grad()
-#     hpos = model3(xpos)
-#     hneg = model3(xneg)
-
-#     loss = (1 - hpos + hneg).square().mean()
-#     (loss).backward()
-#     opt.step()
-#     scheduler.step()
-
-#     model3.eval()
-#     pred_te = model3(X_te, returns='diff')
-#     pred_te = pred_te.detach().cpu().numpy()
-
-#     pred_tr = model3(X_tr, returns='diff')
-#     pred_tr = pred_tr.detach().cpu().numpy()
-
-
-#     fpr_te, tpr_te = roc(pred_te, y_test)
-#     auc_te = AUC(fpr_te, tpr_te)
-
-#     fpr_tr, tpr_tr = roc(pred_tr, y_train)
-#     auc_tr = AUC(fpr_tr, tpr_tr)
-
-#     loss_print = loss.detach().cpu().item()
-#     lr = opt.param_groups[0]['lr']
-#     print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}| lr {lr:.5f}")
-
-loss_fn = torch.nn.CrossEntropyLoss()
-
 for epoch in range(nepoch):
+    model3.train()
     xpos, ypos = next(iter(pos_loader))
     xneg, yneg = next(iter(neg_loader))
 
+    xneg = None; yneg = None
+    nrepeat = 10
+    for _ in range(nrepeat):
+        _xneg, _yneg = next(iter(neg_loader))
+        if xneg is None:
+            xneg = _xneg; yneg = _yneg
+        else:
+            xneg = torch.cat((xneg, _xneg), 0)
+            yneg = torch.cat((yneg, _yneg), 0)
+
+    xpos = t.cat([xpos]*nrepeat, 0)
+    ypos = t.cat([ypos]*nrepeat, 0)
+
     xpos = xpos.to(device); xneg = xneg.to(device)
-    ypos = ypos.to(device); yneg = yneg.to(device)
 
-    X = t.cat((xpos, xneg), 0)
-    y = t.cat((ypos, yneg), 0)
-
-    rixs = t.randperm(len(X))
-
-    X = X[rixs]; y = y[rixs]
-
-    model3.train()
     opt.zero_grad()
-    logits = model3(X)
+    hpos = model3(xpos, returns='diff')
+    hneg = model3(xneg, returns='diff')
 
-    loss = loss_fn(logits, y.long())
-
+    loss = (1 - hpos + hneg).square().mean()
     (loss).backward()
     opt.step()
     scheduler.step()
-
 
     model3.eval()
     pred_te = model3(X_te, returns='diff')
@@ -288,7 +259,6 @@ for epoch in range(nepoch):
     loss_print = loss.detach().cpu().item()
     lr = opt.param_groups[0]['lr']
 
-
     pred_te = model3(X_te, returns='posprob')
     pred_te = pred_te.detach().cpu().numpy()
 
@@ -297,4 +267,59 @@ for epoch in range(nepoch):
 
     acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
     acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
-    print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}|acc_tr {acc_tr:.2f}|acc_te {acc_te:.2f}|lr {lr:.5f}")
+    print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}| acc_tr {acc_tr:.3f}|acc_te {acc_te:.3f}|lr {lr:.5f}")
+
+# loss_fn = torch.nn.CrossEntropyLoss()
+
+# for epoch in range(nepoch):
+#     xpos, ypos = next(iter(pos_loader))
+#     xneg, yneg = next(iter(neg_loader))
+
+#     xpos = xpos.to(device); xneg = xneg.to(device)
+#     ypos = ypos.to(device); yneg = yneg.to(device)
+
+#     X = t.cat((xpos, xneg), 0)
+#     y = t.cat((ypos, yneg), 0)
+
+#     rixs = t.randperm(len(X))
+
+#     X = X[rixs]; y = y[rixs]
+
+#     model3.train()
+#     opt.zero_grad()
+#     logits = model3(X)
+
+#     loss = loss_fn(logits, y.long())
+
+#     (loss).backward()
+#     opt.step()
+#     scheduler.step()
+
+
+#     model3.eval()
+#     pred_te = model3(X_te, returns='diff')
+#     pred_te = pred_te.detach().cpu().numpy()
+
+#     pred_tr = model3(X_tr, returns='diff')
+#     pred_tr = pred_tr.detach().cpu().numpy()
+
+
+#     fpr_te, tpr_te = roc(pred_te, y_test)
+#     auc_te = AUC(fpr_te, tpr_te)
+
+#     fpr_tr, tpr_tr = roc(pred_tr, y_train)
+#     auc_tr = AUC(fpr_tr, tpr_tr)
+
+#     loss_print = loss.detach().cpu().item()
+#     lr = opt.param_groups[0]['lr']
+
+
+#     pred_te = model3(X_te, returns='posprob')
+#     pred_te = pred_te.detach().cpu().numpy()
+
+#     pred_tr = model3(X_tr, returns='posprob')
+#     pred_tr = pred_tr.detach().cpu().numpy()
+
+#     acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
+#     acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
+#     print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}|acc_tr {acc_tr:.2f}|acc_te {acc_te:.2f}|lr {lr:.5f}")
