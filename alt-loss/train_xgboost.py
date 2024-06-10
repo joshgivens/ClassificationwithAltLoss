@@ -1,5 +1,4 @@
-# usage: python ./alt-loss/stochastic_online_linear.py
-## needs `archive/Variant I.csv`
+
 import matplotlib.pyplot as plt
 from numpy import  *
 import pandas as pd
@@ -143,98 +142,50 @@ def roc(pred, label):
 def AUC(fpr, tpr):
     return sum([(tpr[i]+tpr[i-1])*(fpr[i-1]-fpr[i])/2 for i in range(1, len(fpr))])
 
-import torch as t
-import pylab as pl
-from IPython import display
+import xgboost as xgb
+print("shallow model:")
+scale_pos_weight = (len(y_train) - y_train.sum()) / y_train.sum() # == # negative / # positive
+# scale_pos_weight = 1.
+bst = xgb.XGBClassifier(n_estimators=100, max_depth=5, objective='binary:logistic', scale_pos_weight=scale_pos_weight)
+bst.fit(X_train, y_train)
+pred_te = bst.predict(X_test)
+pred_tr = bst.predict(X_train)
 
-# Let us maximize the AUC
-import torch # bring out the big gun
+prob_tr = bst.predict_proba(X_train)
+prob_te = bst.predict_proba(X_test)
+score_tr = prob_tr[:,1] - prob_tr[:,0]
+score_te = prob_te[:,1] - prob_te[:,0]
 
-torch.manual_seed(0)
+fpr_te, tpr_te = roc(score_te, y_test)
+auc_te = AUC(fpr_te, tpr_te)
 
-class Model1(torch.nn.Module):
-    def __init__(self, d):
-        super(Model1, self).__init__()
-        self.w = torch.nn.Parameter(torch.randn(d))
-        self.alpha = torch.nn.Parameter(t.tensor(0.1,))
-        self.a = torch.nn.Parameter(t.tensor(0.))
-        self.b = torch.nn.Parameter(t.tensor(0.))
-        self.sigmoid = torch.nn.Sigmoid()
-    def forward(self, X, y):
-        p1 = y.sum() / len(y)
+fpr_tr, tpr_tr = roc(score_tr, y_train)
+auc_tr = AUC(fpr_tr, tpr_tr)
 
-        alpha = self.alpha
-        a = self.a; b = self.b
-        w = self.w
-
-        Xw = X @ w # (batch,)
-        y = (y > 0).float() # y = 1 if it is positive class, else 0
-        loss = (1-p1) * (Xw - a).square() * y
-        loss += p1 * (Xw - b).square() * (1.-y)
-        loss += 2 * (1.+alpha)*(p1*Xw * (1.-y) -(1.-p1)*Xw*y)
-        loss += -p1*(1-p1)*alpha.square()
-        loss = loss.mean()
-        pred = Xw
-        return pred, loss
-
-    def adjust_gradients_for_opt(self):
-        """see eqn. 13 from https://papers.nips.cc/paper_files/paper/2016/file/c52f1bd66cc19d05628bd8bf27af3ad6-Paper.pdf"""
-        self.alpha.grad = -self.alpha.grad
+acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
+acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
+print(f"auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}|acc_tr {acc_tr:.2f}|acc_te {acc_te:.2f}")
 
 
+print("deeper model:")
+scale_pos_weight = (len(y_train) - y_train.sum()) / y_train.sum() # == # negative / # positive
+# scale_pos_weight = 1.
+bst = xgb.XGBClassifier(n_estimators=100, max_depth=20, objective='binary:logistic', scale_pos_weight=scale_pos_weight)
+bst.fit(X_train, y_train)
+pred_te = bst.predict(X_test)
+pred_tr = bst.predict(X_train)
 
-X_tr = torch.tensor(X_train, dtype = torch.float32)
-y_tr = torch.tensor(y_train, dtype = torch.float32)
-X_te = torch.tensor(X_test, dtype = torch.float32)
-y_te = torch.tensor(y_test, dtype = torch.float32)
+prob_tr = bst.predict_proba(X_train)
+prob_te = bst.predict_proba(X_test)
+score_tr = prob_tr[:,1] - prob_tr[:,0]
+score_te = prob_te[:,1] - prob_te[:,0]
 
-dataset = torch.utils.data.TensorDataset(X_tr, y_tr)
-weights = torch.ones_like(y_tr)
+fpr_te, tpr_te = roc(score_te, y_test)
+auc_te = AUC(fpr_te, tpr_te)
 
-weights[y_tr == 1] = (len(y_tr) - y_tr.sum()) / y_tr.sum() # == num_p0 * w_0 == num_p1 * w1
-weights[y_tr == 0] = 1.
+fpr_tr, tpr_tr = roc(score_tr, y_train)
+auc_tr = AUC(fpr_tr, tpr_tr)
 
-weights = weights / weights.sum()
-sampler = torch.utils.data.WeightedRandomSampler(weights, len(dataset), replacement=True)
-trainload = torch.utils.data.DataLoader(dataset, batch_size = 10000, sampler=sampler)
-
-model1 = Model1(X_tr.shape[1])
-
-nepoch = 100
-opt = torch.optim.Adam(model1.parameters(), lr=1e-2)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, nepoch, eta_min=1e-5)
-
-for epoch in range(nepoch):
-    for x, y in trainload:
-        model1.train()
-        opt.zero_grad()
-        # min step, optimizes w, a, b
-        pred, loss = model1(x, y)
-        (loss).backward()
-        model1.adjust_gradients_for_opt()
-        opt.step()
-
-
-    pred_te, test_loss = model1(X_te, y_te)
-    test_loss.detach()
-    pred_te = pred_te.detach().numpy()
-
-    pred_tr, train_loss = model1(X_tr, y_tr)
-    train_loss.detach()
-    pred_tr = pred_tr.detach().numpy()
-
-
-    fpr_te, tpr_te = roc(pred_te, y_test)
-    auc_te = AUC(fpr_te, tpr_te)
-
-    fpr_tr, tpr_tr = roc(pred_tr, y_train)
-    auc_tr = AUC(fpr_tr, tpr_tr)
-
-    lr = opt.param_groups[0]['lr']
-    acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
-    acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
-    print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}| acc_tr {acc_tr:.3f}|acc_te {acc_te:.3f}|lr {lr:.5f}")
-    # pl.plot(fpr, tpr, label = 'epoch %d, AUC: %0.2f' % (epoch, auc))
-    # pl.legend(loc = 'lower right')
-    # display.display(pl.gcf())
-    # display.clear_output(wait=True)
+acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
+acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
+print(f"auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}|acc_tr {acc_tr:.2f}|acc_te {acc_te:.2f}")

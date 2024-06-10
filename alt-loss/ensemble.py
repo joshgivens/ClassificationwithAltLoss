@@ -1,5 +1,3 @@
-# usage: python ./alt-loss/stochastic_online_linear.py
-## needs `archive/Variant I.csv`
 import matplotlib.pyplot as plt
 from numpy import  *
 import pandas as pd
@@ -145,83 +143,171 @@ def AUC(fpr, tpr):
 
 import torch as t
 import pylab as pl
-from IPython import display
 
 # Let us maximize the AUC
 import torch # bring out the big gun
 
 torch.manual_seed(0)
 
-class Model1(torch.nn.Module):
+class MLP(torch.nn.Module):
     def __init__(self, d):
-        super(Model1, self).__init__()
-        self.w = torch.nn.Parameter(torch.randn(d))
-        self.alpha = torch.nn.Parameter(t.tensor(0.1,))
-        self.a = torch.nn.Parameter(t.tensor(0.))
-        self.b = torch.nn.Parameter(t.tensor(0.))
-        self.sigmoid = torch.nn.Sigmoid()
-    def forward(self, X, y):
-        p1 = y.sum() / len(y)
+        super().__init__()
+        self.fc1 = torch.nn.Linear(d, d*3)
+        self.fc2 = torch.nn.Linear(d*3, d)
+        self.dropout = torch.nn.Dropout(0.1)
+        self.relu = torch.nn.ReLU()
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x
 
-        alpha = self.alpha
-        a = self.a; b = self.b
-        w = self.w
+class Block(torch.nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.mlp1 = MLP(d)
+        self.mlp2 = MLP(d)
+        self.bn = torch.nn.BatchNorm1d(d)
+        self.ln1 = torch.nn.LayerNorm(d)
+        self.ln2 = torch.nn.LayerNorm(d)
+        self.relu = torch.nn.ReLU()
+        self.out = torch.nn.Linear(d, 2)
+    def forward(self, x):
+        x = x + self.mlp1(self.ln1(x))
+        # x = x + self.mlp2(self.ln2(x))
+        return self.out(x)
 
-        Xw = X @ w # (batch,)
-        y = (y > 0).float() # y = 1 if it is positive class, else 0
-        loss = (1-p1) * (Xw - a).square() * y
-        loss += p1 * (Xw - b).square() * (1.-y)
-        loss += 2 * (1.+alpha)*(p1*Xw * (1.-y) -(1.-p1)*Xw*y)
-        loss += -p1*(1-p1)*alpha.square()
-        loss = loss.mean()
-        pred = Xw
-        return pred, loss
+# class Block(torch.nn.Module):
+#     def __init__(self, d):
+#         super().__init__()
+#         self.out = torch.nn.Linear(d, 2)
+#     def forward(self, x):
+#         return self.out(x)
 
-    def adjust_gradients_for_opt(self):
-        """see eqn. 13 from https://papers.nips.cc/paper_files/paper/2016/file/c52f1bd66cc19d05628bd8bf27af3ad6-Paper.pdf"""
-        self.alpha.grad = -self.alpha.grad
+class Model3(torch.nn.Module):
+    def __init__(self, d):
+        super(Model3, self).__init__()
+        self.h = Block(d)
+
+    def forward(self, X, returns='logits'):
+        logits = self.h(X).squeeze()
+        if returns == 'both':
+            ps = torch.nn.functional.softmax(logits, dim=1)
+            diff = ps[:,1] - ps[:,0] # positive
+            return logits, diff
+        if returns == 'logits': return logits
+        elif returns == 'posprob':
+            ps = torch.nn.functional.softmax(logits, dim=1)
+            return ps[:,1] # p(y==1|x) is second columns of ps
+        elif returns == 'diff':
+            ps = torch.nn.functional.softmax(logits, dim=1)
+            return ps[:,1] - ps[:,0] # positive
+        else:
+            raise ValueError('returns is not valid')
+
+class Ensemble(torch.nn.Module):
+    def __init__(self, d, n):
+        super(Ensemble, self).__init__()
+        self.models = torch.nn.ModuleList([Model3(d) for _ in range(n)])
+        self.n = n
+    def forward(self, X, returns='logits'):
+        if returns == 'both':
+            results = [m(X, returns=returns) for m in self.models]
+            results = [[x,y] for (x,y) in results]
+        else:
+            results = [[m(X, returns=returns)] for m in self.models]
+
+        res = results[0]
+        for i in range(1, self.n):
+            for j in range(len(res)): res[j] += results[i][j]
+        for j in range(len(res)): res[j] /= self.n
+
+        if returns == 'both':
+            return (res[0], res[1])
+        else:
+            return res[0]
 
 
 
-X_tr = torch.tensor(X_train, dtype = torch.float32)
-y_tr = torch.tensor(y_train, dtype = torch.float32)
-X_te = torch.tensor(X_test, dtype = torch.float32)
-y_te = torch.tensor(y_test, dtype = torch.float32)
+
+device = 'cuda'
+X_tr = torch.tensor(X_train, dtype = torch.float32, device=device)
+y_tr = torch.tensor(y_train, dtype = torch.float32, device=device)
+X_te = torch.tensor(X_test, dtype = torch.float32, device=device)
+y_te = torch.tensor(y_test, dtype = torch.float32, device=device)
 
 dataset = torch.utils.data.TensorDataset(X_tr, y_tr)
-weights = torch.ones_like(y_tr)
 
-weights[y_tr == 1] = (len(y_tr) - y_tr.sum()) / y_tr.sum() # == num_p0 * w_0 == num_p1 * w1
-weights[y_tr == 0] = 1.
+pos_dataset = torch.utils.data.TensorDataset(X_tr[y_tr == 1], y_tr[y_tr == 1])
+neg_dataset = torch.utils.data.TensorDataset(X_tr[y_tr == 0], y_tr[y_tr == 0])
 
-weights = weights / weights.sum()
-sampler = torch.utils.data.WeightedRandomSampler(weights, len(dataset), replacement=True)
-trainload = torch.utils.data.DataLoader(dataset, batch_size = 10000, sampler=sampler)
+batch_size = min([10000, len(pos_dataset), len(neg_dataset)])
 
-model1 = Model1(X_tr.shape[1])
+pos_loader = torch.utils.data.DataLoader(pos_dataset, batch_size = batch_size)
+neg_loader = torch.utils.data.DataLoader(neg_dataset, batch_size = batch_size)
 
-nepoch = 100
-opt = torch.optim.Adam(model1.parameters(), lr=1e-2)
+# ppath = "params/model3_tune.pth"
+# model3 = Model3(X_tr.shape[1]).to(device)
+
+# model3.load_state_dict(torch.load(ppath))
+model3 = Ensemble(X_tr.shape[1], 3).to(device)
+
+nepoch = 200
+opt = torch.optim.Adam(model3.parameters(), lr=3e-3, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, nepoch, eta_min=1e-5)
 
+cross_ent = torch.nn.CrossEntropyLoss()
+
+"""%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"""
 for epoch in range(nepoch):
-    for x, y in trainload:
-        model1.train()
-        opt.zero_grad()
-        # min step, optimizes w, a, b
-        pred, loss = model1(x, y)
-        (loss).backward()
-        model1.adjust_gradients_for_opt()
-        opt.step()
+    model3.train()
+
+    xneg = None; yneg = None
+    xpos, ypos = next(iter(pos_loader))
+    # nrepeat = 89
+    nrepeat = 2
+    for i, (_xneg, _yneg) in enumerate(neg_loader):
+      if i == nrepeat: break
+      if xneg is None:
+          xneg = _xneg; yneg = _yneg
+      else:
+          xneg = torch.cat((xneg, _xneg), 0)
+          yneg = torch.cat((yneg, _yneg), 0)
+
+    xpos = t.cat([xpos]*nrepeat, 0)
+    ypos = t.cat([ypos]*nrepeat, 0).long()
+    yneg = yneg.long()
+
+    assert len(xpos) == len(xneg), f"wrong number of pairwise samples. try decreasing n_repeat...?"
+
+    xpos = xpos.to(device); xneg = xneg.to(device)
+
+    opt.zero_grad()
+    hpos, hpos_score = model3(xpos, returns='both')
+    hneg, hneg_score = model3(xneg, returns='both')
+
+    pos_ce = cross_ent(hpos, ypos)
+    neg_ce = cross_ent(hneg, yneg)
+    l2 = (1 - hpos_score + hneg_score).square().mean()
+    # loss = l2 + pos_ce + neg_ce
+
+    # hinge = (1- hpos_score + hneg_score).clamp(min=0).mean()
+    # loss = pos_ce + neg_ce + hinge
+
+    # loss = hinge
+    loss = l2
 
 
-    pred_te, test_loss = model1(X_te, y_te)
-    test_loss.detach()
-    pred_te = pred_te.detach().numpy()
+    (loss).backward()
+    opt.step()
+    scheduler.step()
 
-    pred_tr, train_loss = model1(X_tr, y_tr)
-    train_loss.detach()
-    pred_tr = pred_tr.detach().numpy()
+    model3.eval()
+    pred_te = model3(X_te, returns='diff')
+    pred_te = pred_te.detach().cpu().numpy()
+
+    pred_tr = model3(X_tr, returns='diff')
+    pred_tr = pred_tr.detach().cpu().numpy()
 
 
     fpr_te, tpr_te = roc(pred_te, y_test)
@@ -230,11 +316,15 @@ for epoch in range(nepoch):
     fpr_tr, tpr_tr = roc(pred_tr, y_train)
     auc_tr = AUC(fpr_tr, tpr_tr)
 
+    loss_print = loss.detach().cpu().item()
     lr = opt.param_groups[0]['lr']
+
+    pred_te = model3(X_te, returns='posprob')
+    pred_te = pred_te.detach().cpu().numpy()
+
+    pred_tr = model3(X_tr, returns='posprob')
+    pred_tr = pred_tr.detach().cpu().numpy()
+
     acc_tr = sum((pred_tr > 0.5) == y_train)/len(y_train)
     acc_te = sum((pred_te > 0.5) == y_test)/len(y_test)
     print(f"ep {epoch:04d}|loss {loss:.4f}|auc_tr {auc_tr:.4f}|auc_te {auc_te:.4f}| acc_tr {acc_tr:.3f}|acc_te {acc_te:.3f}|lr {lr:.5f}")
-    # pl.plot(fpr, tpr, label = 'epoch %d, AUC: %0.2f' % (epoch, auc))
-    # pl.legend(loc = 'lower right')
-    # display.display(pl.gcf())
-    # display.clear_output(wait=True)
